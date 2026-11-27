@@ -15,7 +15,7 @@ from pyrogram.enums import ParseMode
 CHANNELS = [-1003911112940]
 AUTH_CHANNEL = -1003926879089
 BOT_USERNAME = "Anujith2bot"
-BANNER_PHOTO = "https://ibb.co/277K9hcv"
+BANNER_PHOTO = "https://ibb.co/0VRrx7xw"
 
 
 # ==========================================
