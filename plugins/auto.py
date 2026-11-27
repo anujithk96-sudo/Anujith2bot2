@@ -10,7 +10,7 @@ from pyrogram.enums import ParseMode
 # ==========================================
 
 CHANNELS = [-1003911112940]
-AUTH_CHANNEL = -1002110922261 -1003926879089
+AUTH_CHANNEL = -1003926879089
 BOT_USERNAME = "Anujith2bot"
 BANNER_PHOTO = "https://ibb.co/cS5zrTGD"
 
@@ -238,9 +238,9 @@ def get_quality(filename, message=None):
 
     # Support common aliases while keeping the output in the same format.
     normalized = filename.lower()
-    if re.search(r"(?<!\\w)4k(?!\\w)", normalized):
+    if re.search(r"(?<!\w)4k(?!\w)", normalized):
         return "2160p"
-    if re.search(r"(?<!\\w)fhd(?!\\w)", normalized):
+    if re.search(r"(?<!\w)fhd(?!\w)", normalized):
         return "1080p"
 
     # If the filename has no quality, use the actual video height when
@@ -303,61 +303,93 @@ def make_start_link(serial_name):
 
 
 # ==========================================
-# BATCH PROCESSING STORAGE (SERIAL WISE)
+# SMART BATCH PROCESSING STORAGE
+# SERIAL + SEASON + QUALITY WISE
 # ==========================================
 
 pending_batches = defaultdict(list)
 batch_timers = {}
+BATCH_WAIT_SECONDS = 7
 
 
-async def process_batch(client, chat_id, serial_name):
-    await asyncio.sleep(5)  # എല്ലാ ഫയലുകളും എത്തുവാൻ 5 സെക്കൻഡ് കാത്തിരിക്കുന്നു
+# ==========================================
+# EXTRACT EPISODE NUMBERS
+# Supports S01E1086, S01E1086-1087,
+# EP1086, Episode 1086 and 1086-1087
+# ==========================================
 
-    batch_key = (chat_id, serial_name)
-    if batch_key not in pending_batches or not pending_batches[batch_key]:
-        return
+def extract_episode_numbers(filename):
+    episodes = set()
 
-    batch_items = pending_batches[batch_key].copy()
-    pending_batches[batch_key].clear()
+    patterns = (
+        r"(?<![A-Za-z0-9])S\d{1,2}[ ._-]*E(?:P)?[ ._-]*(\d{1,4})"
+        r"(?:[ ._-]*-[ ._-]*(?:E(?:P)?[ ._-]*)?(\d{1,4}))?(?!\d)",
+        r"(?<![A-Za-z0-9])(?:EPISODE|EP|E)[ ._-]*(\d{1,4})"
+        r"(?:[ ._-]*-[ ._-]*(?:(?:EPISODE|EP|E)[ ._-]*)?(\d{1,4}))?(?!\d)",
+        r"(?<!\d)(\d{3,4})[ ._-]+-[ ._-]*(\d{3,4})(?!\d)",
+    )
 
-    if batch_key in batch_timers:
-        del batch_timers[batch_key]
+    for pattern in patterns:
+        for match in re.finditer(pattern, filename, re.IGNORECASE):
+            for value in match.groups():
+                if value:
+                    number = int(value)
+                    if number > 0:
+                        episodes.add(number)
 
+    return episodes
+
+
+# ==========================================
+# FORMAT EPISODE NUMBERS
+# ==========================================
+
+def format_episode_range(episodes):
+    episodes = sorted(set(episodes))
+
+    if not episodes:
+        return "N/A"
+    if len(episodes) == 1:
+        return str(episodes[0])
+
+    continuous = all(
+        episodes[index + 1] == episodes[index] + 1
+        for index in range(len(episodes) - 1)
+    )
+
+    if continuous:
+        return f"{episodes[0]}-{episodes[-1]}"
+
+    # Do not claim a continuous range when episode numbers are missing.
+    return ", ".join(str(number) for number in episodes)
+
+
+# ==========================================
+# PROCESS ONE SERIAL/SEASON/QUALITY BATCH
+# ==========================================
+
+async def process_batch(client, batch_key):
     try:
-        sample_message = batch_items[0]
-        filename = get_file_name(sample_message)
+        # Debounce: wait until this serial's files stop arriving.
+        await asyncio.sleep(BATCH_WAIT_SECONDS)
 
-        season = get_season(filename)
-        quality = get_quality(filename, sample_message)
+        if not pending_batches.get(batch_key):
+            return
 
-        # ഫയൽ പേരുകളിൽ നിന്ന് S01E01 അല്ലെങ്കിൽ E85 പോലുള്ള കൃത്യമായ എപ്പിസോഡ് മാത്രം എടുക്കുന്നു
-        all_episodes = []
-        for message in batch_items:
-            f_name = get_file_name(message)
-            
-            # പ്രധാനമായും S01E05 അല്ലെങ്കിൽ E05 / Ep 5 രീതിയിലുള്ളവ മാത്രം ടാർഗെറ്റ് ചെയ്യുന്നു
-            match_e = re.search(r'[sS]\d+[ ._-]*[eE](\d+)', f_name)
-            if match_e:
-                all_episodes.append(int(match_e.group(1)))
-            else:
-                match_ep_word = re.findall(r'\b(?:ep(?:isode)?|e)\s*[-_.]*(\d{1,4})\b', f_name, re.IGNORECASE)
-                if match_ep_word:
-                    for ep in match_ep_word:
-                        num = int(ep)
-                        if num > 0:
-                            all_episodes.append(num)
+        batch_items = pending_batches.pop(batch_key, [])
+        current_task = asyncio.current_task()
+        if batch_timers.get(batch_key) is current_task:
+            batch_timers.pop(batch_key, None)
 
-        # എപ്പിസോഡ് റേഞ്ച് ശരിയായി ക്രമീകരിക്കുന്നു (ഒറ്റ ഫയൽ ആണെങ്കിൽ ആ നമ്പർ മാത്രം വരും)
-        if all_episodes:
-            all_episodes = sorted(list(set(all_episodes)))
-            min_ep = min(all_episodes)
-            max_ep = max(all_episodes)
-            if min_ep != max_ep:
-                episode = f"{min_ep}-{max_ep}"
-            else:
-                episode = str(min_ep)
-        else:
-            episode = "1"
+        chat_id, serial_name, season, quality = batch_key
+        all_episodes = set()
+
+        for item in batch_items:
+            all_episodes.update(
+                extract_episode_numbers(get_file_name(item))
+            )
+
+        episode = format_episode_range(all_episodes)
 
         caption = (
             "<b>🍁Anujith Allu TV Serials🍁</b>\n\n"
@@ -367,18 +399,12 @@ async def process_batch(client, chat_id, serial_name):
             f"🎬 <b>Quality :</b> {quality}"
         )
 
-        bot_link = make_start_link(serial_name)
-
-        buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📥 Get File",
-                        url=bot_link
-                    )
-                ]
-            ]
-        )
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "📥 Get File",
+                url=make_start_link(serial_name)
+            )
+        ]])
 
         await client.send_photo(
             chat_id=AUTH_CHANNEL,
@@ -390,18 +416,21 @@ async def process_batch(client, chat_id, serial_name):
 
         print(
             "Auto-post successful | "
-            f"Name: {serial_name} | "
-            f"Season: {season} | "
-            f"Episode: {episode} | "
-            f"Quality: {quality}"
+            f"Name: {serial_name} | Season: {season} | "
+            f"Episode: {episode} | Quality: {quality} | "
+            f"Files: {len(batch_items)}"
         )
 
+    except asyncio.CancelledError:
+        # A new matching file arrived; its handler will schedule a fresh timer.
+        return
     except Exception as error:
         print(f"Auto-Formatter Error: {error}")
 
 
 # ==========================================
-# AUTO POST HANDLER (MULTI-SERIAL SUPPORT)
+# AUTO POST HANDLER
+# MULTI-SERIAL + SEASON + QUALITY SUPPORT
 # ==========================================
 
 @Client.on_message(
@@ -409,12 +438,32 @@ async def process_batch(client, chat_id, serial_name):
     & (filters.document | filters.video)
 )
 async def auto_post_formatter(client, message):
-    chat_id = message.chat.id
     filename = get_file_name(message)
     serial_name = get_clean_serial_name(filename)
-    
-    batch_key = (chat_id, serial_name)
+    season = get_season(filename)
+    quality = get_quality(filename, message)
+
+    # Separate groups prevent different serials, seasons or qualities
+    # from being combined into one channel post.
+    batch_key = (
+        message.chat.id,
+        serial_name,
+        season,
+        quality
+    )
+
     pending_batches[batch_key].append(message)
 
-    if batch_key not in batch_timers:
-        batch_timers[batch_key] = asyncio.create_task(process_batch(client, chat_id, serial_name))
+    # Restart only this batch's timer when another matching file arrives.
+    old_task = batch_timers.get(batch_key)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    batch_timers[batch_key] = asyncio.create_task(
+        process_batch(client, batch_key)
+    )
+
+    print(
+        f"Batch received | {serial_name} | Season {season} | "
+        f"Quality {quality} | Files: {len(pending_batches[batch_key])}"
+    )
